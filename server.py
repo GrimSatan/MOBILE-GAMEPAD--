@@ -127,13 +127,28 @@ app.config['SECRET_KEY'] = 'mgp-secret-key-2025'
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 
 vg = None
-gamepad = None
+
+# ── Multi-gamepad state ───────────────────────────────────────────────────────
+MAX_PLAYERS   = 4
+# slot_to_sid[slot] = sid | None   (slots are 1-indexed: 1..4)
+slot_to_sid   = {i: None for i in range(1, MAX_PLAYERS + 1)}
+# sid_to_slot[sid] = slot number
+sid_to_slot   = {}
+# sid_to_gamepad[sid] = VX360Gamepad instance
+sid_to_gamepad = {}
+# sids that were rejected because the room was full — used to suppress
+# misleading "desconectado" logs in on_disconnect.
+_rejected_sids = set()
+# sid -> { 'left': float, 'right': float }  joystick throttle timestamps
+_last_joy_time_map = {}
+
 BUTTON_MAP = {}
 
 
 def init_gamepad():
-    global vg, gamepad, BUTTON_MAP
-    print("[*] Iniciando control virtual Xbox 360...")
+    """Verifica el driver y carga el módulo vgamepad (no crea instancias todavía)."""
+    global vg, BUTTON_MAP
+    print("[*] Verificando driver Virtual Xbox 360...")
     if not is_vigembus_installed():
         if not install_vigembus():
             print("\n[!] ViGEmBus es indispensable para emular el control de Xbox.")
@@ -144,7 +159,6 @@ def init_gamepad():
     try:
         import vgamepad as _vg
         vg = _vg
-        gamepad = vg.VX360Gamepad()
         BUTTON_MAP = {
             'A':          vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
             'B':          vg.XUSB_BUTTON.XUSB_GAMEPAD_B,
@@ -162,23 +176,60 @@ def init_gamepad():
             'DPAD_LEFT':  vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT,
             'DPAD_RIGHT': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT,
         }
-        print("[OK] Control virtual creado correctamente")
+        print("[OK] Módulo vgamepad cargado — listo para crear mandos virtuales")
     except Exception as e:
-        print(f"\n[ERROR] No se pudo inicializar el control virtual: {e}")
+        print(f"\n[ERROR] No se pudo cargar vgamepad: {e}")
         print("Asegúrate de haber completado la instalación del driver ViGEmBus.")
         input("\nPresiona Enter para salir...")
         sys.exit(1)
 
 
-def reset_gamepad():
-    """Release all inputs."""
-    if gamepad is None:
-        return
-    try:
-        gamepad.reset()
-        gamepad.update()
-    except Exception as e:
-        print(f"[WARN] Error al resetear gamepad: {e}")
+def _free_slot():
+    """Devuelve el primer slot libre (1-4) o None si todos están ocupados."""
+    for slot in range(1, MAX_PLAYERS + 1):
+        if slot_to_sid[slot] is None:
+            return slot
+    return None
+
+
+def _create_gamepad_for(sid):
+    """Crea un VX360Gamepad para el sid dado y lo registra."""
+    slot = _free_slot()
+    if slot is None:
+        return None
+    gp = vg.VX360Gamepad()
+    sid_to_gamepad[sid] = gp
+    sid_to_slot[sid]    = slot
+    slot_to_sid[slot]   = sid
+    print(f"[+] Mando virtual creado → Jugador {slot} (sid={sid[:8]}...)")
+    return slot
+
+
+def _release_gamepad_for(sid):
+    """Resetea y libera el gamepad del sid dado."""
+    gp = sid_to_gamepad.pop(sid, None)
+    if gp:
+        try:
+            gp.reset()
+            gp.update()
+        except Exception:
+            pass
+    slot = sid_to_slot.pop(sid, None)
+    if slot:
+        slot_to_sid[slot] = None
+        # Liberar también el throttle map del joystick de este sid
+        _last_joy_time_map.pop(sid, None)
+        print(f"[-] Mando virtual liberado ← Jugador {slot} (sid={sid[:8]}...)")
+
+
+def reset_all_gamepads():
+    """Resetea todos los mandos activos (usado al cerrar el servidor)."""
+    for gp in list(sid_to_gamepad.values()):
+        try:
+            gp.reset()
+            gp.update()
+        except Exception as e:
+            print(f"[WARN] Error al resetear gamepad: {e}")
 
 
 def get_local_ip() -> str:
@@ -249,23 +300,51 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/pc')
+def pc_gamepad():
+    """Página del Modo PC: permite usar el gamepad con el teclado del PC."""
+    return render_template('pc_gamepad.html')
+
+
 # ── Socket.IO events ──────────────────────────────────────────────────────────
 @socketio.on('connect')
 def on_connect():
+    from flask import request as flask_req
+    sid       = flask_req.sid
     client_ip = flask_request_remote_addr()
-    print(f'[+] Celular conectado  [{client_ip}]')
-    emit('status', {'connected': True})
+
+    slot = _create_gamepad_for(sid)
+    if slot is None:
+        print(f'[!] Sala llena — rechazando conexión [{client_ip}]')
+        # Marcar sid como rechazado ANTES de desconectar, para que
+        # on_disconnect no imprima logs confusos.
+        _rejected_sids.add(sid)
+        emit('room_full', {'max': MAX_PLAYERS})
+        return False  # flask-socketio: retornar False rechaza la conexión limpiamente
+
+    active = sum(1 for s in slot_to_sid.values() if s is not None)
+    print(f'[+] Celular conectado  [{client_ip}]  → Jugador {slot}  ({active}/{MAX_PLAYERS} slots)')
+    emit('assigned_player', {'player': slot, 'max': MAX_PLAYERS})
 
 
 @socketio.on('disconnect')
 def on_disconnect():
-    print('[-] Celular desconectado -- reseteando gamepad')
-    reset_gamepad()
+    from flask import request as flask_req
+    sid = flask_req.sid
+    if sid in _rejected_sids:
+        _rejected_sids.discard(sid)
+        # No había gamepad asignado, sólo limpiar el flag
+        return
+    _release_gamepad_for(sid)
+    active = sum(1 for s in slot_to_sid.values() if s is not None)
+    print(f'[-] Celular desconectado  ({active}/{MAX_PLAYERS} slots activos)')
 
 
 @socketio.on('button')
 def on_button(data):
     """Recibe: { name: 'A', pressed: true/false }"""
+    from flask import request as flask_req
+    gamepad = sid_to_gamepad.get(flask_req.sid)
     if not gamepad:
         return
     name    = str(data.get('name', '')).upper()
@@ -283,33 +362,36 @@ def on_button(data):
         print(f'[WARN] Button error ({name}): {e}')
 
 
-_last_joy_time = {'left': 0.0, 'right': 0.0}
 _JOY_MIN_INTERVAL = 0.005
 
 @socketio.on('joystick')
 def on_joystick(data):
     """Recibe: { side: 'left'/'right', x: float, y: float }  (-1.0 a 1.0)"""
+    from flask import request as flask_req
+    sid     = flask_req.sid
+    gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
     side = str(data.get('side', 'left'))
     x    = max(-1.0, min(1.0, float(data.get('x', 0))))
     y    = max(-1.0, min(1.0, float(data.get('y', 0))))
-    
+
+    joy_times = _last_joy_time_map.setdefault(sid, {'left': 0.0, 'right': 0.0})
     is_zero = (abs(x) < 0.001 and abs(y) < 0.001)
-    
+
     if not is_zero:
         now = time.monotonic()
-        if now - _last_joy_time.get(side, 0) < _JOY_MIN_INTERVAL:
+        if now - joy_times.get(side, 0) < _JOY_MIN_INTERVAL:
             return
-        _last_joy_time[side] = now
+        joy_times[side] = now
     else:
-        _last_joy_time[side] = 0
+        joy_times[side] = 0.0
         x = 0.0
         y = 0.0
 
     ix = int(x * 32767)
     iy = int(y * 32767)
-    
+
     try:
         if side == 'left':
             gamepad.left_joystick(x_value=ix, y_value=iy)
@@ -323,6 +405,8 @@ def on_joystick(data):
 @socketio.on('trigger')
 def on_trigger(data):
     """Recibe: { side: 'left'/'right', value: float }  (0.0 a 1.0)"""
+    from flask import request as flask_req
+    gamepad = sid_to_gamepad.get(flask_req.sid)
     if not gamepad:
         return
     side     = str(data.get('side', 'left'))
@@ -346,7 +430,7 @@ def flask_request_remote_addr():
 
 def signal_handler(sig, frame):
     print('\n[*] Deteniendo servidor...')
-    reset_gamepad()
+    reset_all_gamepads()
     sys.exit(0)
 
 

@@ -30,6 +30,12 @@
       --text:         #ffffff;
       --text-dim:     rgba(255,255,255,0.5);
       --bar-h:        34px;
+
+      /* Player slot colors */
+      --p1-color: #00e676;  /* green  */
+      --p2-color: #2979ff;  /* blue   */
+      --p3-color: #ff1744;  /* red    */
+      --p4-color: #ffd600;  /* yellow */
     }
 
     html, body {
@@ -137,6 +143,56 @@
     #edit-btn  { border-color: rgba(124,77,255,0.6); color: #cbb4ff; background: rgba(124,77,255,0.15); }
     #done-btn  { border-color: rgba(0,230,118,0.6); color: #00e676; background: rgba(0,230,118,0.15); display: none; }
     #reset-btn { border-color: rgba(255,152,0,0.6); color: #ffb74d; background: rgba(255,152,0,0.15); display: none; }
+
+    /* Player badge */
+    #player-badge {
+      display: none;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      border: 1px solid currentColor;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: all 0.3s ease;
+    }
+    #player-badge.visible { display: flex; }
+    #player-badge .badge-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 6px currentColor;
+      animation: pulseDot 2s ease-in-out infinite;
+    }
+    @keyframes pulseDot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.6; transform: scale(0.8); }
+    }
+
+    /* Full-room overlay */
+    #room-full-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(12,13,20,0.97);
+      z-index: 9998;
+      flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 14px;
+      padding: 32px;
+      text-align: center;
+    }
+    #room-full-overlay.visible { display: flex; }
+    #room-full-overlay .rf-icon { font-size: 52px; }
+    #room-full-overlay .rf-title {
+      font-size: 22px; font-weight: 700;
+      color: #ff5252; letter-spacing: 0.5px;
+    }
+    #room-full-overlay .rf-sub {
+      font-size: 14px; color: var(--text-dim);
+    }
 
     /* ═══════════════════════════════════════
        CONTROLLER CANVAS & GROUPS
@@ -432,6 +488,8 @@
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+      touch-action: auto;          /* permitir scroll/drag nativo del slider */
+      -webkit-user-select: auto;   /* el thumb necesita selección natural */
     }
 
     #edit-panel.visible { display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -553,7 +611,9 @@
 <div id="status-bar">
   <div id="conn-dot" class="connecting"></div>
   <span id="conn-text">Conectando...</span>
+  <span id="player-badge"><span class="badge-dot"></span><span id="player-label">P1</span></span>
   <button class="bar-btn" id="fs-btn">⛶ Pantalla Completa</button>
+  <button class="bar-btn" id="pc-btn" title="Abrí esta URL en tu PC: misma IP que el QR, con /pc al final">🖥 Modo PC</button>
   <button class="bar-btn" id="edit-btn">✏ Mover Botones</button>
   <button class="bar-btn" id="reset-btn">↺ Reset</button>
   <button class="bar-btn" id="done-btn">✓ Guardar</button>
@@ -636,6 +696,13 @@
 
 </div><!-- #controller -->
 
+<!-- Full-room overlay -->
+<div id="room-full-overlay">
+  <div class="rf-icon">🎮🚫</div>
+  <div class="rf-title">SALA LLENA</div>
+  <div class="rf-sub">Ya hay 4 mandos conectados.<br>Desconecta uno e intenta de nuevo.</div>
+</div>
+
 <!-- Edit Panel for individual button config -->
 <div id="edit-panel">
   <div class="ep-title" id="ep-btn-name">Botón</div>
@@ -693,6 +760,25 @@ if (fsBtn) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   PC MODE BUTTON — muestra la URL de /pc para que el usuario
+   la abra en su PC (no tiene sentido abrirla en el celular)
+═══════════════════════════════════════════════════════════ */
+const pcBtn = document.getElementById('pc-btn');
+if (pcBtn) {
+  pcBtn.addEventListener('click', () => {
+    const url = `${location.protocol}//${location.host}/pc`;
+    // Copiar al portapapeles si se puede; si no, mostrar en el toast
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url)
+        .then(() => showToast(`🖥 URL copiada al portapapeles: ${url}`, 3500))
+        .catch(() => showToast(`🖥 Abrí esta URL en tu PC: ${url}`, 4000));
+    } else {
+      showToast(`🖥 Abrí esta URL en tu PC: ${url}`, 4000);
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
    SOCKET.IO CLIENT INITIALIZATION
 ═══════════════════════════════════════════════════════════ */
 let socket = null;
@@ -712,13 +798,55 @@ try {
       reconnectionDelay: 1000
     });
 
+    // Player colors indexed 1-4
+    const PLAYER_COLORS = {
+      1: 'var(--p1-color)',
+      2: 'var(--p2-color)',
+      3: 'var(--p3-color)',
+      4: 'var(--p4-color)',
+    };
+
+    const playerBadge = document.getElementById('player-badge');
+    const playerLabel = document.getElementById('player-label');
+    const roomFullOverlay = document.getElementById('room-full-overlay');
+
+    function applyPlayerColor(n) {
+      const color = PLAYER_COLORS[n] || 'var(--accent)';
+      if (playerBadge) {
+        playerBadge.style.color = color;
+        playerBadge.style.borderColor = color;
+        playerBadge.style.textShadow = `0 0 8px ${color}`;
+      }
+      if (connDot) {
+        connDot.style.background = color;
+        connDot.style.boxShadow = `0 0 10px ${color}`;
+      }
+    }
+
     socket.on('connect', () => {
       updateConnStatus('connected', 'Conectado ✓');
-      showToast('¡Mando Conectado al PC! 🎮');
+    });
+
+    socket.on('assigned_player', (data) => {
+      const n = data.player;
+      const max = data.max || 4;
+      if (playerBadge) { playerBadge.classList.add('visible'); }
+      if (playerLabel) { playerLabel.textContent = `Jugador ${n}`; }
+      applyPlayerColor(n);
+      updateConnStatus('connected', `Conectado ✓`);
+      showToast(`🎮 Eres el Jugador ${n}/${max}`);
+    });
+
+    socket.on('room_full', () => {
+      if (roomFullOverlay) roomFullOverlay.classList.add('visible');
+      updateConnStatus('disconnected', 'Sala llena');
     });
 
     socket.on('disconnect', () => {
       updateConnStatus('disconnected', 'Desconectado');
+      if (playerBadge) playerBadge.classList.remove('visible');
+      if (playerLabel) playerLabel.textContent = '';
+      if (connDot) { connDot.style.background = ''; connDot.style.boxShadow = ''; }
     });
 
     socket.on('connect_error', () => {
@@ -734,13 +862,19 @@ try {
 
 /* ═══════════════════════════════════════════════════════════
    PREVENT DEFAULT TOUCH SCROLLING & GESTURES
+   (Excluimos: status-bar, edit-panel y el slider, para que
+    los controles del panel de edición respondan al touch en
+    el celular — sino el slider queda con "click" en vez de
+    "touch" y no se puede arrastrar el thumb.)
 ═══════════════════════════════════════════════════════════ */
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('touchmove', e => {
-  if (!e.target.closest('#status-bar')) e.preventDefault();
+  if (e.target.closest('#status-bar, #edit-panel')) return;
+  e.preventDefault();
 }, { passive: false });
 document.addEventListener('touchstart', e => {
-  if (!e.target.closest('#status-bar')) e.preventDefault();
+  if (e.target.closest('#status-bar, #edit-panel')) return;
+  e.preventDefault();
 }, { passive: false });
 
 /* ═══════════════════════════════════════════════════════════
@@ -1160,11 +1294,21 @@ function applyBtnConfig(groupId) {
   const el = document.getElementById(groupId);
   if (!el || !cfg) return;
 
-  // Apply scale
-  if (cfg.scale) {
-    el.style.transform = `scale(${cfg.scale})`;
-    el.style.transformOrigin = 'top left';
+  // Preservar el transform "base" de cada grupo (p.ej. #grp-center usa
+  // translateX(-50%) para centrarse). Sólo sobreescribimos la parte de
+  // scale/translate del style inline de manera compuesta.
+  const baseTransforms = {
+    'grp-center': 'translateX(-50%)',
+  };
+  const base = baseTransforms[groupId] || '';
+  const scale = cfg.scale || 1;
+
+  if (base) {
+    el.style.transform = `${base} scale(${scale})`;
+  } else {
+    el.style.transform = `scale(${scale})`;
   }
+  el.style.transformOrigin = 'top left';
 
   // Apply visibility
   if (cfg.hidden) {
@@ -1226,7 +1370,7 @@ function updateHideButton(isHidden) {
   }
 }
 
-// Size slider handler
+// Size slider handler — 'input' se dispara en cada cambio (mouse drag y touch drag)
 if (epSizeSlider) {
   epSizeSlider.addEventListener('input', () => {
     if (!selectedGroup) return;
@@ -1236,9 +1380,15 @@ if (epSizeSlider) {
     applyBtnConfig(selectedGroup);
     saveBtnConfigs();
   });
+  // Asegurar que el slider no pierda foco en el touchend (algunos browsers
+  // mobile hacen blur y disparan 'change' en vez de 'input' continuo)
+  epSizeSlider.addEventListener('pointerdown', e => e.stopPropagation());
+  epSizeSlider.addEventListener('touchstart',  e => e.stopPropagation(), { passive: true });
 }
 
-// Toggle hide handler
+// Toggle hide handler — 'click' se dispara en mouse Y en touch (después
+// de touchend), por lo que cubre ambos. Como ya excluimos #edit-panel del
+// preventDefault() global, el touch llega correctamente.
 if (epToggleHide) {
   epToggleHide.addEventListener('click', () => {
     if (!selectedGroup) return;

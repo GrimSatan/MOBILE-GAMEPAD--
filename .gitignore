@@ -29,3 +29,7 @@ env/
 # Omitimos estáticos cacheados si prefieres descargarlos, aunque ya los tienes.
 # (Se subirán los .bat, .vbs, server.py, templates y estáticos)
 DOCUMENTACION-EDICION-BOTONES.md
+build-and-zip.ps1
+DOC-DEPLOY-ZIP.md
+DOC-DEPLOY-ZIP.md
+DOC-DEPLOY-ZIP.md
