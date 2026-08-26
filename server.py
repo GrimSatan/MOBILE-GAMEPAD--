@@ -111,7 +111,9 @@ def install_vigembus():
         return False
 
 
-from flask import Flask, render_template
+import threading
+
+from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
 
 try:
@@ -124,7 +126,13 @@ except ImportError:
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'), static_folder=os.path.join(BASE_DIR, 'static'))
 app.config['SECRET_KEY'] = 'mgp-secret-key-2025'
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
+socketio = SocketIO(
+    app,
+    cors_allowed_origins='*',
+    async_mode='threading',
+    ping_timeout=10,
+    ping_interval=5,
+)
 
 vg = None
 
@@ -141,8 +149,18 @@ sid_to_gamepad = {}
 _rejected_sids = set()
 # sid -> { 'left': float, 'right': float }  joystick throttle timestamps
 _last_joy_time_map = {}
+# sid -> { 'left': float, 'right': float }  trigger throttle timestamps
+_last_trigger_time_map = {}
+# sid -> { btn_name: float }  per-button throttle timestamp (cada botón independiente)
+_last_button_time_map = {}
 
 BUTTON_MAP = {}
+
+# ── Batching state ────────────────────────────────────────────────────────────
+# sid -> bool  whether this gamepad has pending changes to flush
+_dirty = {}
+_dirty_lock = threading.Lock()
+_BATCH_INTERVAL = 0.008  # 8ms = ~125 flushes/sec (~120fps cap)
 
 
 def init_gamepad():
@@ -192,6 +210,37 @@ def _free_slot():
     return None
 
 
+def _mark_dirty(sid):
+    """Marca un gamepad como teniendo cambios pendientes para flush."""
+    with _dirty_lock:
+        _dirty[sid] = True
+
+
+def _flush_gamepad(sid):
+    """Envía el reporte acumulado al driver para un gamepad específico."""
+    gp = sid_to_gamepad.get(sid)
+    if gp:
+        try:
+            gp.update()
+        except Exception:
+            pass
+
+
+def _flush_worker():
+    """Background thread que hace flush de todos los gamepads sucios cada _BATCH_INTERVAL."""
+    while True:
+        time.sleep(_BATCH_INTERVAL)
+        with _dirty_lock:
+            dirty_sids = list(_dirty.keys())
+            _dirty.clear()
+        for sid in dirty_sids:
+            _flush_gamepad(sid)
+
+
+_flush_thread = threading.Thread(target=_flush_worker, daemon=True)
+_flush_thread.start()
+
+
 def _create_gamepad_for(sid):
     """Crea un VX360Gamepad para el sid dado y lo registra."""
     slot = _free_slot()
@@ -217,8 +266,12 @@ def _release_gamepad_for(sid):
     slot = sid_to_slot.pop(sid, None)
     if slot:
         slot_to_sid[slot] = None
-        # Liberar también el throttle map del joystick de este sid
+        # Liberar throttle maps de este sid
         _last_joy_time_map.pop(sid, None)
+        _last_trigger_time_map.pop(sid, None)
+        _last_button_time_map.pop(sid, None)
+        with _dirty_lock:
+            _dirty.pop(sid, None)
         print(f"[-] Mando virtual liberado ← Jugador {slot} (sid={sid[:8]}...)")
 
 
@@ -230,6 +283,8 @@ def reset_all_gamepads():
             gp.update()
         except Exception as e:
             print(f"[WARN] Error al resetear gamepad: {e}")
+    with _dirty_lock:
+        _dirty.clear()
 
 
 def get_local_ip() -> str:
@@ -309,18 +364,15 @@ def pc_gamepad():
 # ── Socket.IO events ──────────────────────────────────────────────────────────
 @socketio.on('connect')
 def on_connect():
-    from flask import request as flask_req
-    sid       = flask_req.sid
-    client_ip = flask_request_remote_addr()
+    sid       = request.sid
+    client_ip = request.remote_addr or '?'
 
     slot = _create_gamepad_for(sid)
     if slot is None:
         print(f'[!] Sala llena — rechazando conexión [{client_ip}]')
-        # Marcar sid como rechazado ANTES de desconectar, para que
-        # on_disconnect no imprima logs confusos.
         _rejected_sids.add(sid)
         emit('room_full', {'max': MAX_PLAYERS})
-        return False  # flask-socketio: retornar False rechaza la conexión limpiamente
+        return False
 
     active = sum(1 for s in slot_to_sid.values() if s is not None)
     print(f'[+] Celular conectado  [{client_ip}]  → Jugador {slot}  ({active}/{MAX_PLAYERS} slots)')
@@ -329,22 +381,30 @@ def on_connect():
 
 @socketio.on('disconnect')
 def on_disconnect():
-    from flask import request as flask_req
-    sid = flask_req.sid
+    sid = request.sid
     if sid in _rejected_sids:
         _rejected_sids.discard(sid)
-        # No había gamepad asignado, sólo limpiar el flag
         return
     _release_gamepad_for(sid)
     active = sum(1 for s in slot_to_sid.values() if s is not None)
     print(f'[-] Celular desconectado  ({active}/{MAX_PLAYERS} slots activos)')
 
 
+# ── Throttle constants ────────────────────────────────────────────────────────
+_JOY_MIN_INTERVAL   = 0.005   # 5ms between joystick updates per side per player
+_BTN_MIN_INTERVAL   = 0.008   # 8ms between button updates per player (shared)
+_TRIG_MIN_INTERVAL  = 0.008   # 8ms between trigger updates per side per player
+
+
 @socketio.on('button')
 def on_button(data):
-    """Recibe: { name: 'A', pressed: true/false }"""
-    from flask import request as flask_req
-    gamepad = sid_to_gamepad.get(flask_req.sid)
+    """Recibe: { name: 'A', pressed: true/false }
+    Botones: flush INMEDIATO (sin batching) para latencia 0ms en eventos críticos.
+    Throttle por botón individual (no compartido) para no perder inputs rápidos
+    en juegos de pelea donde se presionan 2-3 botones en <16ms.
+    """
+    sid     = request.sid
+    gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
     name    = str(data.get('name', '')).upper()
@@ -352,23 +412,43 @@ def on_button(data):
     btn     = BUTTON_MAP.get(name)
     if btn is None:
         return
+
+    # Throttle per-button: cada botón tiene su propio timestamp independiente.
+    # - press: throttle normal (anti-spam)
+    # - release: SIEMPRE pasa y resetea el timestamp del botón → garantiza que
+    #   tapping rítmico (release + press rápido) nunca pierda el siguiente press.
+    # Esto resuelve el bug donde tras un release el primer press del mismo botón
+    # se bloqueaba por 8ms — perceptible en juegos de ritmo/lucha.
+    if pressed:
+        now = time.monotonic()
+        btn_times = _last_button_time_map.setdefault(sid, {})
+        if now - btn_times.get(name, 0.0) < _BTN_MIN_INTERVAL:
+            return
+        btn_times[name] = now
+    else:
+        # Release: reset timestamp para que el próximo press de ESE botón
+        # pase inmediatamente sin tener que esperar el cooldown.
+        btn_times = _last_button_time_map.get(sid)
+        if btn_times is not None:
+            btn_times[name] = 0.0
+
     try:
         if pressed:
             gamepad.press_button(button=btn)
         else:
             gamepad.release_button(button=btn)
+        # Flush inmediato para botones: latencia crítica de input.
+        # No usamos batching aquí porque agregar 8ms a un press de botón
+        # es regresión perceptible. El driver maneja cientos de updates/seg OK.
         gamepad.update()
     except Exception as e:
         print(f'[WARN] Button error ({name}): {e}')
 
 
-_JOY_MIN_INTERVAL = 0.005
-
 @socketio.on('joystick')
 def on_joystick(data):
     """Recibe: { side: 'left'/'right', x: float, y: float }  (-1.0 a 1.0)"""
-    from flask import request as flask_req
-    sid     = flask_req.sid
+    sid     = request.sid
     gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
@@ -397,37 +477,47 @@ def on_joystick(data):
             gamepad.left_joystick(x_value=ix, y_value=iy)
         else:
             gamepad.right_joystick(x_value=ix, y_value=iy)
-        gamepad.update()
+        _mark_dirty(sid)
     except Exception as e:
         print(f'[WARN] Joystick error [{side}]: {e}')
 
 
 @socketio.on('trigger')
 def on_trigger(data):
-    """Recibe: { side: 'left'/'right', value: float }  (0.0 a 1.0)"""
-    from flask import request as flask_req
-    gamepad = sid_to_gamepad.get(flask_req.sid)
+    """Recibe: { side: 'left'/'right', value: float }  (0.0 a 1.0)
+    Triggers: flush INMEDIATO. El throttle es POR LADO por jugador
+    (left y right son independientes — no se interfieren entre sí).
+    El reset (value=0) siempre pasa sin throttle para garantizar liberación.
+    """
+    sid     = request.sid
+    gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
     side     = str(data.get('side', 'left'))
     value    = max(0.0, min(1.0, float(data.get('value', 0))))
     byte_val = int(value * 255)
+
+    # Reset (value=0) bypass total: garantizar que el trigger se libere
+    # aunque venga muy rápido. Sin esto, throttle puede tragarse el release.
+    if byte_val > 0:
+        now = time.monotonic()
+        trig_times = _last_trigger_time_map.setdefault(sid, {'left': 0.0, 'right': 0.0})
+        if now - trig_times.get(side, 0) < _TRIG_MIN_INTERVAL:
+            return
+        trig_times[side] = now
+
     try:
         if side == 'left':
             gamepad.left_trigger(value=byte_val)
         else:
             gamepad.right_trigger(value=byte_val)
+        # Flush inmediato: triggers son eventos críticos (disparar = respuesta inmediata).
         gamepad.update()
     except Exception as e:
         print(f'[WARN] Trigger error [{side}]: {e}')
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def flask_request_remote_addr():
-    from flask import request
-    return request.remote_addr or '?'
-
-
 def signal_handler(sig, frame):
     print('\n[*] Deteniendo servidor...')
     reset_all_gamepads()

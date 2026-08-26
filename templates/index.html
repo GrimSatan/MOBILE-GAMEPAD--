@@ -878,9 +878,28 @@ document.addEventListener('touchstart', e => {
 }, { passive: false });
 
 /* ═══════════════════════════════════════════════════════════
+   THROTTLE UTILITY
+   Limits how often a function can fire per key (per side, etc.)
+   Returns a wrapper that only calls fn if enough time has passed.
+   The 'zero' bypass always fires immediately (for releases/resets).
+═══════════════════════════════════════════════════════════ */
+function makeThrottle(minMs) {
+  const last = {};
+  return function throttle(key, fn, bypass) {
+    if (bypass) { last[key] = 0; fn(); return; }
+    const now = performance.now();
+    if ((now - (last[key] || 0)) < minMs) return;
+    last[key] = now;
+    fn();
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
    BUTTON SYSTEM
 ═══════════════════════════════════════════════════════════ */
 let editMode = false;
+
+const btnThrottle = makeThrottle(8);  // 8ms between button events per player
 
 function sendButton(name, pressed) {
   if (socket && socket.connected) {
@@ -894,12 +913,12 @@ function isGroupHidden(btnEl) {
 }
 
 function pressBtn(name) {
-  sendButton(name, true);
+  btnThrottle(name, () => sendButton(name, true), false);
   vibrate(15);
 }
 
 function releaseBtn(name) {
-  sendButton(name, false);
+  btnThrottle(name, () => sendButton(name, false), true);
 }
 
 function bindButton(el, name) {
@@ -990,22 +1009,26 @@ if (dpadEl) {
 /* ═══════════════════════════════════════════════════════════
    ANALOG TRIGGERS (LT / RT)
 ═══════════════════════════════════════════════════════════ */
+const triggerThrottle = makeThrottle(8);  // 8ms between trigger events per side
+
 function bindTrigger(btnId, fillId, side) {
   const btn  = document.getElementById(btnId);
   const fill = document.getElementById(fillId);
   if (!btn || !fill) return;
   let active = false;
 
-  function computeAndSend(e) {
+  function computeAndSend(e, bypass) {
     const rect  = btn.getBoundingClientRect();
     const touch = e.touches[0];
     if (!touch) return;
     const relY  = Math.max(0, Math.min(rect.height, touch.clientY - rect.top));
     const value = 1 - (relY / rect.height);
     fill.style.height = `${value * 100}%`;
-    if (socket && socket.connected) {
-      socket.emit('trigger', { side, value });
-    }
+    triggerThrottle(side, () => {
+      if (socket && socket.connected) {
+        socket.emit('trigger', { side, value });
+      }
+    }, bypass);
   }
 
   btn.addEventListener('touchstart', e => {
@@ -1013,13 +1036,13 @@ function bindTrigger(btnId, fillId, side) {
     e.preventDefault(); e.stopPropagation();
     active = true; btn.classList.add('pressed');
     vibrate(10);
-    computeAndSend(e);
+    computeAndSend(e, true);
   }, { passive: false });
 
   btn.addEventListener('touchmove', e => {
     if (!active || editMode || isGroupHidden(btn)) return;
     e.preventDefault();
-    computeAndSend(e);
+    computeAndSend(e, false);
   }, { passive: false });
 
   function stop(e) {
@@ -1027,9 +1050,11 @@ function bindTrigger(btnId, fillId, side) {
     e.preventDefault();
     active = false; btn.classList.remove('pressed');
     fill.style.height = '0%';
-    if (socket && socket.connected) {
-      socket.emit('trigger', { side, value: 0 });
-    }
+    triggerThrottle(side, () => {
+      if (socket && socket.connected) {
+        socket.emit('trigger', { side, value: 0 });
+      }
+    }, true);
   }
   btn.addEventListener('touchend', stop, { passive: false });
   btn.addEventListener('touchcancel', stop, { passive: false });
@@ -1049,10 +1074,22 @@ function initJoysticks() {
   if (lStick) { try { lStick.destroy(); } catch(_) {} lStick = null; }
   if (rStick) { try { rStick.destroy(); } catch(_) {} rStick = null; }
 
+  const joyThrottle = makeThrottle(5);  // 5ms between joystick events per side
+
+  // Failsafe: si un emit de "reset" se perdiera (red inestable, socket.IO
+  // con buffer lleno), este timestamp rastrea la última vez que el usuario
+  // realmente movió el stick. Si hace >150ms sin movimiento y el stick sigue
+  // "activo", forzamos un reset. Esto previene el bug clásico de joystick
+  // "pegado" en una dirección cuando el touchend se pierde.
+  const stickLastMove = { left: 0, right: 0 };
+  const STICK_STUCK_MS = 150;
+
   function sendJoyZero(side) {
-    if (socket && socket.connected) {
-      socket.emit('joystick', { side, x: 0, y: 0 });
-    }
+    joyThrottle(side, () => {
+      if (socket && socket.connected) {
+        socket.emit('joystick', { side, x: 0, y: 0 });
+      }
+    }, true);
   }
 
   function makeStick(zoneId, side) {
@@ -1070,21 +1107,35 @@ function initJoysticks() {
       fadeTime:    50,
       catchDistance: 150
     });
-    
+
     mgr.on('move', (_, d) => {
       if (!d.vector || !socket || !socket.connected) return;
-      // Add a tiny deadzone of 3% to eliminate idle jitter
       const dist = Math.hypot(d.vector.x, d.vector.y);
+      stickLastMove[side] = performance.now();
       if (dist < 0.03) {
         sendJoyZero(side);
       } else {
-        socket.emit('joystick', { side, x: d.vector.x, y: d.vector.y });
+        joyThrottle(side, () => {
+          socket.emit('joystick', { side, x: d.vector.x, y: d.vector.y });
+        }, false);
       }
     });
 
     mgr.on('end', () => {
       sendJoyZero(side);
     });
+
+    // Watchdog: cada 100ms revisa si el stick quedó "pegado" sin movimiento
+    // por más de STICK_STUCK_MS. Esto cubre el caso de touchend perdido.
+    const watchdog = setInterval(() => {
+      const since = performance.now() - stickLastMove[side];
+      if (since > STICK_STUCK_MS) {
+        // Forzar reset. joyThrottle con bypass=true garantiza que llegue.
+        sendJoyZero(side);
+      }
+    }, 100);
+    // Limpiar watchdog si el stick se destruye
+    mgr.on('destroy', () => clearInterval(watchdog));
 
     // Native touch failsafes
     zone.addEventListener('touchend', () => sendJoyZero(side), { passive: true });

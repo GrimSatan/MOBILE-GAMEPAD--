@@ -652,11 +652,36 @@
   function sendButton(name, pressed) {
     if (socket && socket.connected) socket.emit('button', { name, pressed });
   }
+
+  /* Throttle utility for joystick and trigger emissions */
+  function makeThrottle(minMs) {
+    const last = {};
+    return function throttle(key, fn, bypass) {
+      if (bypass) { last[key] = 0; fn(); return; }
+      const now = performance.now();
+      if ((now - (last[key] || 0)) < minMs) return;
+      last[key] = now;
+      fn();
+    };
+  }
+  // Throttle reducido a 4ms (antes 8ms): con teclado PC el usuario puede
+  // tapar WASD+IJKL muy rápido en combos de juegos de pelea/acción.
+  // 4ms = ~250Hz max, suficiente para teclado (los keyboards reportan a ~125Hz)
+  // y evita que inputs consecutivos se pierdan.
+  const joyThrottle  = makeThrottle(4);   // 4ms between joystick events per side
+  const trigThrottle = makeThrottle(4);   // 4ms between trigger events per side
+
   function sendJoystick(side, x, y) {
-    if (socket && socket.connected) socket.emit('joystick', { side, x, y });
+    const isZero = (x === 0 && y === 0);
+    joyThrottle(side, () => {
+      if (socket && socket.connected) socket.emit('joystick', { side, x, y });
+    }, isZero);
   }
   function sendTrigger(side, value) {
-    if (socket && socket.connected) socket.emit('trigger', { side, value });
+    const isZero = (value === 0);
+    trigThrottle(side, () => {
+      if (socket && socket.connected) socket.emit('trigger', { side, value });
+    }, isZero);
   }
 
   /* ═══════════════════════════════════════════════════════════
