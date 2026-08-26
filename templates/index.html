@@ -411,6 +411,133 @@
       box-shadow: 0 6px 20px rgba(0,0,0,0.6);
     }
     #toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* ═══════════════════════════════════════
+       EDIT PANEL (Individual Button Config)
+    ═══════════════════════════════════════ */
+    #edit-panel {
+      display: none;
+      position: fixed;
+      bottom: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(20, 22, 36, 0.97);
+      border: 1px solid rgba(124, 77, 255, 0.5);
+      border-radius: 10px;
+      padding: 8px 12px;
+      z-index: 2000;
+      width: max-content;
+      max-width: calc(100vw - 24px);
+      min-width: 260px;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+    }
+
+    #edit-panel.visible { display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+    .ep-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      white-space: nowrap;
+    }
+
+    .ep-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      min-width: 140px;
+    }
+
+    .ep-label {
+      font-size: 9px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.5);
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .ep-slider {
+      flex: 1;
+      height: 4px;
+      min-width: 80px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: rgba(255,255,255,0.2);
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+      touch-action: none;
+    }
+
+    .ep-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 8px var(--accent-glow);
+    }
+
+    .ep-slider::-moz-range-thumb {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      border: none;
+      box-shadow: 0 0 8px var(--accent-glow);
+    }
+
+    .ep-value {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 32px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .ep-btn {
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      font-family: 'Rajdhani', sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border: 1px solid;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .ep-btn:active { transform: scale(0.96); }
+
+    .ep-btn-hide {
+      background: rgba(244, 67, 54, 0.15);
+      border-color: rgba(244, 67, 54, 0.6);
+      color: #ff5252;
+    }
+
+    .ep-btn-show {
+      background: rgba(0, 230, 118, 0.15);
+      border-color: rgba(0, 230, 118, 0.6);
+      color: #00e676;
+    }
+
+    .group.hidden-btn {
+      opacity: 0.2;
+    }
+    .group.hidden-btn:not(.edit-mode) {
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -508,6 +635,17 @@
   </div>
 
 </div><!-- #controller -->
+
+<!-- Edit Panel for individual button config -->
+<div id="edit-panel">
+  <div class="ep-title" id="ep-btn-name">Botón</div>
+  <div class="ep-row">
+    <span class="ep-label">Tamaño</span>
+    <input type="range" id="ep-size-slider" min="0.5" max="2" step="0.05" value="1" class="ep-slider">
+    <span class="ep-value" id="ep-size-value">100%</span>
+  </div>
+  <button class="ep-btn ep-btn-hide" id="ep-toggle-hide"> Ocultar Botón</button>
+</div>
 
 <div id="toast" role="status" aria-live="polite"></div>
 
@@ -616,6 +754,11 @@ function sendButton(name, pressed) {
   }
 }
 
+function isGroupHidden(btnEl) {
+  const group = btnEl.closest('.group');
+  return group && group.classList.contains('hidden-btn');
+}
+
 function pressBtn(name) {
   sendButton(name, true);
   vibrate(15);
@@ -628,14 +771,14 @@ function releaseBtn(name) {
 function bindButton(el, name) {
   if (!el) return;
   el.addEventListener('touchstart', e => {
-    if (editMode) return;
+    if (editMode || isGroupHidden(el)) return;
     e.preventDefault(); e.stopPropagation();
     el.classList.add('pressed');
     pressBtn(name);
   }, { passive: false });
 
   function end(e) {
-    if (editMode) return;
+    if (editMode || isGroupHidden(el)) return;
     e.preventDefault();
     el.classList.remove('pressed');
     releaseBtn(name);
@@ -674,7 +817,7 @@ function touchToDirs(touch, rect) {
 }
 
 function handleDpad(e) {
-  if (editMode) return;
+  if (editMode || (dpadEl && dpadEl.closest('.group')?.classList.contains('hidden-btn'))) return;
   e.preventDefault(); e.stopPropagation();
   const rect = dpadEl.getBoundingClientRect();
   const next = new Set();
@@ -696,7 +839,7 @@ function handleDpad(e) {
 }
 
 function releaseDpad(e) {
-  if (editMode) return;
+  if (editMode || (dpadEl && dpadEl.closest('.group')?.classList.contains('hidden-btn'))) return;
   e.preventDefault();
   activeDirs.forEach(d => releaseBtn(d));
   activeDirs.clear();
@@ -732,7 +875,7 @@ function bindTrigger(btnId, fillId, side) {
   }
 
   btn.addEventListener('touchstart', e => {
-    if (editMode) return;
+    if (editMode || isGroupHidden(btn)) return;
     e.preventDefault(); e.stopPropagation();
     active = true; btn.classList.add('pressed');
     vibrate(10);
@@ -740,13 +883,13 @@ function bindTrigger(btnId, fillId, side) {
   }, { passive: false });
 
   btn.addEventListener('touchmove', e => {
-    if (!active || editMode) return;
+    if (!active || editMode || isGroupHidden(btn)) return;
     e.preventDefault();
     computeAndSend(e);
   }, { passive: false });
 
   function stop(e) {
-    if (editMode) return;
+    if (editMode || isGroupHidden(btn)) return;
     e.preventDefault();
     active = false; btn.classList.remove('pressed');
     fill.style.height = '0%';
@@ -781,6 +924,8 @@ function initJoysticks() {
   function makeStick(zoneId, side) {
     const zone = document.getElementById(zoneId);
     if (!zone) return null;
+    const group = zone.closest('.group');
+    if (group && group.classList.contains('hidden-btn')) return null;
     const mgr = nipplejs.create({
       zone:        zone,
       mode:        'static',
@@ -919,7 +1064,7 @@ function exitEdit() {
     });
     saveLayout(currentLayout);
   }
-  initJoysticks();
+initJoysticks();
   showToast('¡Layout guardado correctamente! ✓');
 }
 
@@ -937,11 +1082,17 @@ if (resetBtn) resetBtn.addEventListener('click', resetLayout);
 // ── Drag Logic for customization ──
 (function setupDragging() {
   document.querySelectorAll('.group').forEach(el => {
-    let tx0, ty0, l0, t0;
+    let tx0, ty0, l0, t0, hasMoved;
 
     el.addEventListener('touchstart', e => {
       if (!editMode) return;
+      if (el.classList.contains('hidden-btn')) {
+        e.stopPropagation();
+        showEditPanel(el.id);
+        return;
+      }
       e.preventDefault(); e.stopPropagation();
+      hasMoved = false;
       const touch = e.touches[0];
       const ctrl  = document.getElementById('controller');
       const cr    = ctrl.getBoundingClientRect();
@@ -956,16 +1107,174 @@ if (resetBtn) resetBtn.addEventListener('click', resetLayout);
       if (!editMode) return;
       e.preventDefault(); e.stopPropagation();
       const touch = e.touches[0];
+      const dx = touch.clientX - tx0, dy = touch.clientY - ty0;
+      // Only mark as moved if finger traveled more than 8px (avoids accidental drags)
+      if (Math.hypot(dx, dy) > 8) hasMoved = true;
+      if (!hasMoved) return;
       const ctrl  = document.getElementById('controller');
       const cw = ctrl.offsetWidth, ch = ctrl.offsetHeight;
-      const dx = touch.clientX - tx0, dy = touch.clientY - ty0;
       const nl = Math.max(0, Math.min(cw - el.offsetWidth,  l0 + dx));
       const nt = Math.max(0, Math.min(ch - el.offsetHeight, t0 + dy));
       el.style.left = `${(nl / cw) * 100}%`;
       el.style.top  = `${(nt / ch) * 100}%`;
     }, { passive: false });
+
+    // Tap = touch without significant movement → open edit panel
+    el.addEventListener('touchend', e => {
+      if (!editMode) return;
+      if (!hasMoved) {
+        e.stopPropagation();
+        showEditPanel(el.id);
+      }
+    }, { passive: false });
   });
 })();
+
+/* ═══════════════════════════════════════════════════════════
+   INDIVIDUAL BUTTON CONFIG (Size & Visibility)
+═══════════════════════════════════════════════════════════ */
+const BTN_CONFIG_KEY = 'mgp-btn-config';
+const editPanel = document.getElementById('edit-panel');
+const epBtnName = document.getElementById('ep-btn-name');
+const epSizeSlider = document.getElementById('ep-size-slider');
+const epSizeValue = document.getElementById('ep-size-value');
+const epToggleHide = document.getElementById('ep-toggle-hide');
+
+let selectedGroup = null;
+let btnConfigs = {};
+
+function loadBtnConfigs() {
+  try {
+    const raw = localStorage.getItem(BTN_CONFIG_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch(_) {}
+  return {};
+}
+
+function saveBtnConfigs() {
+  try { localStorage.setItem(BTN_CONFIG_KEY, JSON.stringify(btnConfigs)); } catch(_) {}
+}
+
+function applyBtnConfig(groupId) {
+  const cfg = btnConfigs[groupId];
+  const el = document.getElementById(groupId);
+  if (!el || !cfg) return;
+
+  // Apply scale
+  if (cfg.scale) {
+    el.style.transform = `scale(${cfg.scale})`;
+    el.style.transformOrigin = 'top left';
+  }
+
+  // Apply visibility
+  if (cfg.hidden) {
+    el.classList.add('hidden-btn');
+  } else {
+    el.classList.remove('hidden-btn');
+  }
+}
+
+function applyAllBtnConfigs() {
+  for (const groupId of Object.keys(btnConfigs)) {
+    applyBtnConfig(groupId);
+  }
+}
+
+function showEditPanel(groupId) {
+  if (!editPanel) return;
+  selectedGroup = groupId;
+  const el = document.getElementById(groupId);
+  if (!el) return;
+
+  // Get button name for display
+  const nameMap = {
+    'grp-lt': 'LT (Trigger)',
+    'grp-rt': 'RT (Trigger)',
+    'grp-lb': 'LB (Bumper)',
+    'grp-rb': 'RB (Bumper)',
+    'grp-dpad': 'D-Pad',
+    'grp-lstick': 'Joystick Izq',
+    'grp-rstick': 'Joystick Der',
+    'grp-face': 'Botones A/B/X/Y',
+    'grp-center': 'Centro (Guide)'
+  };
+
+  const cfg = btnConfigs[groupId] || { scale: 1, hidden: false };
+  btnConfigs[groupId] = cfg;
+
+  epBtnName.textContent = nameMap[groupId] || groupId;
+  epSizeSlider.value = cfg.scale || 1;
+  epSizeValue.textContent = Math.round((cfg.scale || 1) * 100) + '%';
+
+  updateHideButton(cfg.hidden);
+  editPanel.classList.add('visible');
+}
+
+function hideEditPanel() {
+  if (editPanel) editPanel.classList.remove('visible');
+  selectedGroup = null;
+}
+
+function updateHideButton(isHidden) {
+  if (!epToggleHide) return;
+  if (isHidden) {
+    epToggleHide.textContent = ' Mostrar Botón';
+    epToggleHide.className = 'ep-btn ep-btn-show';
+  } else {
+    epToggleHide.textContent = ' Ocultar Botón';
+    epToggleHide.className = 'ep-btn ep-btn-hide';
+  }
+}
+
+// Size slider handler
+if (epSizeSlider) {
+  epSizeSlider.addEventListener('input', () => {
+    if (!selectedGroup) return;
+    const scale = parseFloat(epSizeSlider.value);
+    btnConfigs[selectedGroup].scale = scale;
+    epSizeValue.textContent = Math.round(scale * 100) + '%';
+    applyBtnConfig(selectedGroup);
+    saveBtnConfigs();
+  });
+}
+
+// Toggle hide handler
+if (epToggleHide) {
+  epToggleHide.addEventListener('click', () => {
+    if (!selectedGroup) return;
+    btnConfigs[selectedGroup].hidden = !btnConfigs[selectedGroup].hidden;
+    updateHideButton(btnConfigs[selectedGroup].hidden);
+    applyBtnConfig(selectedGroup);
+    saveBtnConfigs();
+  });
+}
+
+// Add click handlers to groups in edit mode (for mouse users)
+document.querySelectorAll('.group').forEach(grp => {
+  grp.addEventListener('click', e => {
+    if (!editMode) return;
+    e.stopPropagation();
+    showEditPanel(grp.id);
+  });
+});
+
+// Close panel when clicking outside
+document.addEventListener('click', e => {
+  if (editPanel && !editPanel.contains(e.target) && !e.target.closest('.group')) {
+    hideEditPanel();
+  }
+});
+
+// Close panel when exiting edit mode
+const origExitEdit = exitEdit;
+exitEdit = function() {
+  hideEditPanel();
+  origExitEdit();
+};
+
+// Load and apply saved configs
+btnConfigs = loadBtnConfigs();
+applyAllBtnConfigs();
 </script>
 </body>
 </html>
