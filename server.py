@@ -80,7 +80,7 @@ def install_vigembus():
             return False
 
     print("\n[*] Abriendo el instalador de ViGEmBus...")
-    print("    👉 Por favor completa la instalación en la ventana que aparecerá.")
+    print("    -> Por favor completa la instalacion en la ventana que aparecera.")
     try:
         if installer_path.endswith('.msi'):
             result = subprocess.run(['msiexec', '/i', installer_path], timeout=300)
