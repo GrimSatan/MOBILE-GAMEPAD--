@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe
+
+# Zip files
+*.zip
+*.tar.gz
+*.rar
+
+# Entornos virtuales
+venv/
+env/
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.suo
+
+# Omitimos estáticos cacheados si prefieres descargarlos, aunque ya los tienes.
+# (Se subirán los .bat, .vbs, server.py, templates y estáticos)
