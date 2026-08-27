@@ -15,6 +15,10 @@ dist/
 *.tar.gz
 *.rar
 
+# Certificate
+*.pfx
+*.p12
+
 # Entornos virtuales
 venv/
 env/
