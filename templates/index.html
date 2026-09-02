@@ -895,6 +895,67 @@ function makeThrottle(minMs) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   BINARIO: helpers de empaquetado + envío
+   Fase 1: enviar eventos como binary frames en vez de JSON.
+   Reduce bandwidth ~8× y elimina el costo de JSON.stringify/parse.
+
+   Formato de payloads (debe coincidir con server.py Fase 1):
+     joystick: <side:1><x:2><y:2> = 5 bytes   side: 0=left 1=right
+     trigger:  <side:1><value:1> = 2 bytes    value: 0..255
+     button:   <btn_id:1><pressed:1> = 2 bytes
+═══════════════════════════════════════════════════════════ */
+
+// Mapeo inverso: nombre de botón → ID binario (debe coincidir con server.py).
+const BTN_NAME_TO_ID = {
+  'A': 0, 'B': 1, 'X': 2, 'Y': 3,
+  'LB': 4, 'RB': 5,
+  'START': 6, 'SELECT': 7,
+  'GUIDE': 8, 'LS': 9, 'RS': 10,
+  'DPAD_UP': 11, 'DPAD_DOWN': 12,
+  'DPAD_LEFT': 13, 'DPAD_RIGHT': 14,
+};
+
+// Buffers reusables (evitan alloc por evento).
+const _joyBuf  = new ArrayBuffer(5);
+const _joyU8   = new Uint8Array(_joyBuf);
+const _joyView = new DataView(_joyBuf);
+const _trigBuf = new ArrayBuffer(2);
+const _trigU8  = new Uint8Array(_trigBuf);
+const _btnBuf  = new ArrayBuffer(2);
+const _btnU8   = new Uint8Array(_btnBuf);
+
+function sendJoystickBin(side, x, y) {
+  if (!socket || !socket.connected) return;
+  // side: 0 = left, 1 = right
+  const sideByte = side === 'right' ? 1 : 0;
+  // x, y vienen en [-1, 1] de nipple.js → Int16 range [-32767, 32767]
+  const ix = Math.max(-32767, Math.min(32767, Math.round(x * 32767)));
+  const iy = Math.max(-32767, Math.min(32767, Math.round(y * 32767)));
+  _joyView.setUint8(0, sideByte);
+  _joyView.setInt16(1, ix, true);  // little-endian
+  _joyView.setInt16(3, iy, true);
+  socket.emit('joystick', _joyU8);
+}
+
+function sendTriggerBin(side, value) {
+  if (!socket || !socket.connected) return;
+  const sideByte = side === 'right' ? 1 : 0;
+  const byteVal = Math.max(0, Math.min(255, Math.round(value * 255)));
+  _trigBuf[0] = sideByte;
+  _trigBuf[1] = byteVal;
+  socket.emit('trigger', _trigU8);
+}
+
+function sendButtonBin(name, pressed) {
+  if (!socket || !socket.connected) return;
+  const id = BTN_NAME_TO_ID[name];
+  if (id === undefined) return;
+  _btnBuf[0] = id;
+  _btnBuf[1] = pressed ? 1 : 0;
+  socket.emit('button', _btnU8);
+}
+
+/* ═══════════════════════════════════════════════════════════
    BUTTON SYSTEM
 ═══════════════════════════════════════════════════════════ */
 let editMode = false;
@@ -902,9 +963,8 @@ let editMode = false;
 const btnThrottle = makeThrottle(8);  // 8ms between button events per player
 
 function sendButton(name, pressed) {
-  if (socket && socket.connected) {
-    socket.emit('button', { name, pressed });
-  }
+  // Fase 1: enviar como binario en vez de JSON. 2 bytes vs ~30 bytes JSON.
+  sendButtonBin(name, pressed);
 }
 
 function isGroupHidden(btnEl) {
@@ -1025,9 +1085,8 @@ function bindTrigger(btnId, fillId, side) {
     const value = 1 - (relY / rect.height);
     fill.style.height = `${value * 100}%`;
     triggerThrottle(side, () => {
-      if (socket && socket.connected) {
-        socket.emit('trigger', { side, value });
-      }
+      // Fase 1: binario. 2 bytes vs ~25 bytes JSON.
+      sendTriggerBin(side, value);
     }, bypass);
   }
 
@@ -1051,9 +1110,8 @@ function bindTrigger(btnId, fillId, side) {
     active = false; btn.classList.remove('pressed');
     fill.style.height = '0%';
     triggerThrottle(side, () => {
-      if (socket && socket.connected) {
-        socket.emit('trigger', { side, value: 0 });
-      }
+      // Fase 1: binario.
+      sendTriggerBin(side, 0);
     }, true);
   }
   btn.addEventListener('touchend', stop, { passive: false });
@@ -1086,9 +1144,8 @@ function initJoysticks() {
 
   function sendJoyZero(side) {
     joyThrottle(side, () => {
-      if (socket && socket.connected) {
-        socket.emit('joystick', { side, x: 0, y: 0 });
-      }
+      // Fase 1: binario. 5 bytes vs ~33 bytes JSON.
+      sendJoystickBin(side, 0, 0);
     }, true);
   }
 
@@ -1116,7 +1173,8 @@ function initJoysticks() {
         sendJoyZero(side);
       } else {
         joyThrottle(side, () => {
-          socket.emit('joystick', { side, x: d.vector.x, y: d.vector.y });
+          // Fase 1: binario. 5 bytes vs ~33 bytes JSON.
+          sendJoystickBin(side, d.vector.x, d.vector.y);
         }, false);
       }
     });

@@ -13,6 +13,7 @@ import os
 import sys
 import signal
 import socket
+import struct
 import subprocess
 import time
 import urllib.request
@@ -131,7 +132,7 @@ socketio = SocketIO(
     cors_allowed_origins='*',
     async_mode='threading',
     ping_timeout=10,
-    ping_interval=5,
+    ping_interval=25,  # Fase 1: 5s → 25s. Pings frecuentes pausaban el event loop.
 )
 
 vg = None
@@ -157,10 +158,13 @@ _last_button_time_map = {}
 BUTTON_MAP = {}
 
 # ── Batching state ────────────────────────────────────────────────────────────
-# sid -> bool  whether this gamepad has pending changes to flush
+# Fase 1: el batching de joysticks fue eliminado (sumaba 8ms de latencia).
+# Quedan las referencias a _dirty/_mark_dirty por compatibilidad con código que
+# pudiera referenciarlas (no usadas en el path crítico). El flush thread se
+# mantiene porque no hace daño, pero ya no procesa nada.
 _dirty = {}
 _dirty_lock = threading.Lock()
-_BATCH_INTERVAL = 0.008  # 8ms = ~125 flushes/sec (~120fps cap)
+_BATCH_INTERVAL = 0.008  # legado, ya no se usa
 
 
 def init_gamepad():
@@ -391,14 +395,90 @@ def on_disconnect():
 
 
 # ── Throttle constants ────────────────────────────────────────────────────────
-_JOY_MIN_INTERVAL   = 0.005   # 5ms between joystick updates per side per player
-_BTN_MIN_INTERVAL   = 0.008   # 8ms between button updates per player (shared)
-_TRIG_MIN_INTERVAL  = 0.008   # 8ms between trigger updates per side per player
+# Fase 1: reducidos para minimizar latencia per-evento.
+# - joystick: 5ms → 3ms (a 60Hz display da 16.6ms entre frames, 3ms es seguro)
+# - button: 8ms → 5ms (per-button, ya teníamos release-bypass)
+# - trigger: 8ms → 5ms (per-side, ya teníamos reset-bypass)
+_JOY_MIN_INTERVAL   = 0.003
+_BTN_MIN_INTERVAL   = 0.005
+_TRIG_MIN_INTERVAL  = 0.005
+
+# Offset en el primer byte de los payloads binarios: identifica qué lado/control.
+# Formato binario de joystick: <side:1><x:2><y:2> = 5 bytes
+#   side: 0 = left, 1 = right
+# Formato binario de trigger:  <side:1><value:1> = 2 bytes
+#   side: 0 = left, 1 = right; value: 0..255
+# Formato binario de button:   <btn_id:1><pressed:1> = 2 bytes
+#   btn_id: ver _BTN_BIN_MAP; pressed: 0/1
+
+
+# Mapa de IDs binarios para botones (mismo orden conceptual que BUTTON_MAP).
+# Se mantiene sincronizado con el cliente (ver index.html).
+_BTN_BIN_MAP = {
+    0:  'A',          1:  'B',
+    2:  'X',          3:  'Y',
+    4:  'LB',         5:  'RB',
+    6:  'START',      7:  'SELECT',
+    8:  'GUIDE',      9:  'LS',
+    10: 'RS',
+    11: 'DPAD_UP',    12: 'DPAD_DOWN',
+    13: 'DPAD_LEFT',  14: 'DPAD_RIGHT',
+}
+
+
+def _parse_joystick(data):
+    """Devuelve (side, x, y) desde JSON dict o payload binario (5 bytes)."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        if len(data) < 5:
+            return None
+        side_byte, x_raw, y_raw = struct.unpack_from('<Bhh', bytes(data[:5]))
+        side = 'left' if side_byte == 0 else 'right'
+        x = max(-1.0, min(1.0, x_raw / 32767.0))
+        y = max(-1.0, min(1.0, y_raw / 32767.0))
+        return side, x, y
+    if isinstance(data, dict):
+        side = str(data.get('side', 'left'))
+        x = max(-1.0, min(1.0, float(data.get('x', 0))))
+        y = max(-1.0, min(1.0, float(data.get('y', 0))))
+        return side, x, y
+    return None
+
+
+def _parse_trigger(data):
+    """Devuelve (side, value) desde JSON dict o payload binario (2 bytes)."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        if len(data) < 2:
+            return None
+        side_byte, value = struct.unpack_from('<BB', bytes(data[:2]))
+        side = 'left' if side_byte == 0 else 'right'
+        return side, value / 255.0
+    if isinstance(data, dict):
+        side = str(data.get('side', 'left'))
+        value = max(0.0, min(1.0, float(data.get('value', 0))))
+        return side, value
+    return None
+
+
+def _parse_button(data):
+    """Devuelve (name, pressed) desde JSON dict o payload binario (2 bytes)."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        if len(data) < 2:
+            return None
+        btn_id, pressed = struct.unpack_from('<BB', bytes(data[:2]))
+        name = _BTN_BIN_MAP.get(btn_id)
+        if name is None:
+            return None
+        return name, bool(pressed)
+    if isinstance(data, dict):
+        name = str(data.get('name', '')).upper()
+        pressed = bool(data.get('pressed', False))
+        return name, pressed
+    return None
 
 
 @socketio.on('button')
 def on_button(data):
-    """Recibe: { name: 'A', pressed: true/false }
+    """Recibe dict { name, pressed } o binario <btn_id:1><pressed:1> (2 bytes).
     Botones: flush INMEDIATO (sin batching) para latencia 0ms en eventos críticos.
     Throttle por botón individual (no compartido) para no perder inputs rápidos
     en juegos de pelea donde se presionan 2-3 botones en <16ms.
@@ -407,9 +487,13 @@ def on_button(data):
     gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
-    name    = str(data.get('name', '')).upper()
-    pressed = bool(data.get('pressed', False))
-    btn     = BUTTON_MAP.get(name)
+
+    parsed = _parse_button(data)
+    if parsed is None:
+        return
+    name, pressed = parsed
+
+    btn = BUTTON_MAP.get(name)
     if btn is None:
         return
 
@@ -418,7 +502,7 @@ def on_button(data):
     # - release: SIEMPRE pasa y resetea el timestamp del botón → garantiza que
     #   tapping rítmico (release + press rápido) nunca pierda el siguiente press.
     # Esto resuelve el bug donde tras un release el primer press del mismo botón
-    # se bloqueaba por 8ms — perceptible en juegos de ritmo/lucha.
+    #   se bloqueaba por 8ms — perceptible en juegos de ritmo/lucha.
     if pressed:
         now = time.monotonic()
         btn_times = _last_button_time_map.setdefault(sid, {})
@@ -447,14 +531,20 @@ def on_button(data):
 
 @socketio.on('joystick')
 def on_joystick(data):
-    """Recibe: { side: 'left'/'right', x: float, y: float }  (-1.0 a 1.0)"""
+    """Recibe dict { side, x, y } o binario <side:1><x:2><y:2> (5 bytes).
+
+    Fase 1: eliminamos el batching (8ms de delay) y hacemos flush inmediato.
+    El throttle per-side evita spam sin agregar latencia agregada.
+    """
     sid     = request.sid
     gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
-    side = str(data.get('side', 'left'))
-    x    = max(-1.0, min(1.0, float(data.get('x', 0))))
-    y    = max(-1.0, min(1.0, float(data.get('y', 0))))
+
+    parsed = _parse_joystick(data)
+    if parsed is None:
+        return
+    side, x, y = parsed
 
     joy_times = _last_joy_time_map.setdefault(sid, {'left': 0.0, 'right': 0.0})
     is_zero = (abs(x) < 0.001 and abs(y) < 0.001)
@@ -477,14 +567,16 @@ def on_joystick(data):
             gamepad.left_joystick(x_value=ix, y_value=iy)
         else:
             gamepad.right_joystick(x_value=ix, y_value=iy)
-        _mark_dirty(sid)
+        # Fase 1: flush inmediato (sin batching). El throttle per-side ya
+        # limita la frecuencia; el batch de 8ms solo agregaba latencia.
+        gamepad.update()
     except Exception as e:
         print(f'[WARN] Joystick error [{side}]: {e}')
 
 
 @socketio.on('trigger')
 def on_trigger(data):
-    """Recibe: { side: 'left'/'right', value: float }  (0.0 a 1.0)
+    """Recibe dict { side, value } o binario <side:1><value:1> (2 bytes).
     Triggers: flush INMEDIATO. El throttle es POR LADO por jugador
     (left y right son independientes — no se interfieren entre sí).
     El reset (value=0) siempre pasa sin throttle para garantizar liberación.
@@ -493,8 +585,12 @@ def on_trigger(data):
     gamepad = sid_to_gamepad.get(sid)
     if not gamepad:
         return
-    side     = str(data.get('side', 'left'))
-    value    = max(0.0, min(1.0, float(data.get('value', 0))))
+
+    parsed = _parse_trigger(data)
+    if parsed is None:
+        return
+    side, value = parsed
+
     byte_val = int(value * 255)
 
     # Reset (value=0) bypass total: garantizar que el trigger se libere
