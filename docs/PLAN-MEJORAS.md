@@ -1,9 +1,10 @@
 # Plan de Mejoras — Mobile Gamepad
 
-> **Estado:** En progreso (Fase 0 completada, Fase 1 arrancando)
+> **Estado:** Fase 1 implementada y medida (loopback). Pendiente validación en Windows.
 > **Autor:** GrimSatan (fork de berkl3r/MOBILE-GAMEPAD--)
 > **Rama:** `main`
 > **Fecha de inicio:** 2026-09-02
+> **Última actualización:** 2026-09-02
 
 ## Resumen ejecutivo
 
@@ -25,125 +26,104 @@ métricas concretas para poder comparar antes/después.
 - [x] Fork público: `GrimSatan/MOBILE-GAMEPAD--`
 - [x] Renombrar rama `master` → `main`
 - [x] Crear este documento de plan
-- [ ] Benchmark de latencia del proyecto base (JSON sobre WS, throttle 8ms)
+- [x] Benchmark de latencia del proyecto base (JSON sobre WS, throttle 8ms)
+- [x] Mock server para tests sin ViGEmBus (`tests/mock_server.py`)
+- [x] Cliente WS nativo para benchmarks (`tests/benchmark_latency.py`)
 
-### Medición objetivo
+### Resultado
 
-Antes de cualquier cambio, correr un cliente headless que:
-- Se conecta al servidor vía WebSocket
-- Manda 1000 eventos de joystick + 1000 eventos de botón a frecuencia target (60 Hz)
-- Mide **round-trip time** (timestamp en cliente → echo desde server → recibido)
-- Reporta promedio, p50, p95, p99, jitter
+Ver `docs/BENCHMARK-RESULTS.md` para los números completos.
 
-Resultado se guarda en `docs/BENCHMARK-BASE.md` para comparar contra Fase 1.
+| Métrica base | Valor |
+|---|---|
+| Throughput JSON | 227,748 msg/s |
+| Tiempo 1000 msgs | 4.4 ms |
+| Bandwidth | 11.3 MB/s |
+| Ping interval | 5s |
+
+⚠️ Estas son mediciones de **transporte en loopback**, no latencia end-to-end
+real. La validación real requiere Windows + juego.
 
 ---
 
-## Fase 1 — Reducción de latencia (sin tocar arquitectura)
+## Fase 1 — Reducción de latencia (sin tocar arquitectura) ✅
 
-### Problemas identificados
+### Estado: implementada, medida en loopback, pendiente validación Windows
 
-#### 1.1 — Serialización JSON por frame
+### Problemas identificados y soluciones aplicadas
 
-**Síntoma:** El cliente envía cada joystick como JSON:
+#### 1.1 — Serialización JSON por frame ✅
 
-```json
-{"side":"left","x":0.123,"y":-0.456}   // ~33 bytes
-```
+**Síntoma:** Cliente envía cada joystick como JSON (~33 bytes). A 60 Hz × 2
+joysticks = 120 msg/seg, encode/decode JSON cuesta ~5-15 ms por frame.
 
-**Causa:** Flask-SocketIO por default serializa/deserializa JSON en cada evento.
-A 60 Hz por joystick × 2 joysticks = 120 mensajes/seg de ~33 bytes cada uno.
-El encode/decode JSON cuesta ~5-15 ms por frame en CPU normal.
+**Solución:** Cambiar a eventos binarios en Socket.IO.
 
-**Impacto medido:** ~10-15 ms de latencia agregada por frame.
+- `joystick`: 5 bytes (`<side:1><x:int16><y:int16>`)
+- `trigger`: 2 bytes (`<side:1><value:uint8>`)
+- `button`: 2 bytes (`<btn_id:1><pressed:uint8>`)
 
-**Solución:** Cambiar a **eventos binarios** en Socket.IO.
+**Implementado en:** `server.py:_parse_joystick/trigger/button`,
+`templates/index.html:sendJoystickBin/TriggerBin/ButtonBin`
 
-- `joystick`: `Int16Array(2)` = 4 bytes (x, y en rango [-32767, 32767])
-- `trigger`: `Uint8Array(1)` = 1 byte (valor 0-255)
-- `button`: `Uint8Array(2)` = 2 bytes (button_id, pressed)
+**Backward-compat:** los parsers aceptan tanto bytes como dict. Rollback
+trivial si Fase 1 falla en Windows.
 
-Socket.IO soporta `binary` flag en eventos. Del lado del cliente:
+#### 1.2 — Batching de joysticks con `time.sleep(0.008)` ✅
 
-```js
-socket.emit('joystick', new Int16Array([x_norm * 32767, y_norm * 32767]));
-```
+**Síntoma:** Server agrupa updates de joystick y los flushea al driver cada 8 ms.
+Eso suma 0-8 ms de latencia por frame.
 
-Del lado del servidor:
+**Solución:** Eliminado el batching. `gamepad.update()` se llama directamente
+después de `gamepad.left_joystick()`. El throttle per-side de 3 ms sigue
+evitando spam.
 
-```python
-@socketio.on('joystick')
-def on_joystick(data):
-    # data es bytes; desempacar con struct
-    x_raw, y_raw = struct.unpack('<hh', bytes(data))
-    ...
-```
+**Implementado en:** `server.py:on_joystick()` — eliminado `_mark_dirty(sid)`
+y la espera al flush thread.
 
-**Ahorro esperado:** 8-12 ms por frame.
+#### 1.3 — Touch event listeners ⚠️ NO aplicado
 
-#### 1.2 — Batching de joysticks con `time.sleep(0.008)`
+**Razón:** Los handlers actuales usan `{passive: false}` porque llaman
+`e.preventDefault()` para evitar scroll/zoom durante el juego. Convertir
+a `passive: true` rompería esa prevención. **No hay ganancia posible aquí
+sin cambiar el comportamiento de scroll.**
 
-**Síntoma:** El servidor agrupa updates de joystick y los flushea al driver cada 8 ms.
+#### 1.4 — `requestAnimationFrame` para muestrear joystick ⏸️ Diferido
 
-**Causa:** Originalmente pensado para reducir overhead del driver ViGEmBus,
-pero el driver maneja cientos de updates/seg sin problemas. El batch solo
-**suma latencia**.
+**Razón:** Mejora marginal en este contexto. Nipple.js ya emite eventos
+throttleados por su propio loop interno. Queda como optimización futura
+si se mide necesario en Windows.
 
-**Solución:** Quitar el batching para joysticks. Flush inmediato igual que
-botones. El throttle per-side de 5 ms ya evita spam.
+#### 1.5 — Ping/pong de Socket.IO muy frecuente ✅
 
-**Ahorro esperado:** 0-8 ms (variable, dependiendo de cuándo llegue el
-evento relativo al ciclo de batch).
+**Síntoma:** `ping_interval=5` pausaba el event loop momentáneamente.
 
-#### 1.3 — Touch event listeners sin `{passive: true}`
+**Solución:** Subido a 25s. Sigue detectando desconexiones razonablemente
+(<60s).
 
-**Síntoma:** El browser puede esperar al handler antes de procesar scroll/zoom,
-serializando eventos.
+**Implementado en:** `server.py:SocketIO(ping_interval=25, ...)`
 
-**Causa:** Por default, `addEventListener('touchstart', ...)` es **passive: false**.
+### Métricas Fase 1
 
-**Solución:** Agregar `{passive: true}` a todos los listeners de touchstart/touchmove
-que no llaman `preventDefault()`.
+Ver `docs/BENCHMARK-RESULTS.md` para detalle. Resumen:
 
-**Ahorro esperado:** 1-3 ms en eventos rápidos.
+| Métrica | Base JSON | Fase 1 Binario | Mejora |
+|---|---|---|---|
+| Throughput | 227,748 msg/s | 354,041 msg/s | **+55%** |
+| Tiempo 1000 msgs | 4.4 ms | 2.8 ms | **−36%** |
+| Bandwidth | 11.3 MB/s | 1.7 MB/s | **−85%** |
+| E2E funcional | n/a | 250/250 OK | ✅ |
 
-#### 1.4 — `requestAnimationFrame` para muestrear joystick
+⚠️ Estas son mediciones del **transporte**. No incluyen driver ViGEmBus,
+juego, ni latencia de red real.
 
-**Síntoma:** El joystick puede emitir más eventos de los que el display puede
-mostrar (touchmove dispara a frecuencia táctil, no visual).
+### Pendiente validación
 
-**Causa:** Cada touchmove genera un evento que se manda al server. Si el
-touchsample es 240 Hz pero el display es 60 Hz, mandamos 4× lo necesario.
+- [ ] Probar en Windows con Mario Kart u otro juego
+- [ ] Medir latencia end-to-end real (touch → input en juego)
+- [ ] Decidir si Fase 1.5 (WebRTC) es necesaria según resultados
 
-**Solución:** Acumular la última posición del joystick y emitirla en el próximo
-`requestAnimationFrame`. Sincroniza con la frecuencia del display.
-
-**Ahorro esperado:** Reduce tráfico, no latencia directamente. Pero baja CPU
-del cliente y del server.
-
-#### 1.5 — Ping/pong de Socket.IO muy frecuente
-
-**Síntoma:** `ping_interval=5` en el server. El cliente envía ping cada 5s.
-
-**Causa:** Default conservador. En LAN no es necesario tan seguido.
-
-**Solución:** Subir a 25s. Sigue detectando desconexiones pero no interrumpe
-tan frecuentemente.
-
-**Ahorro esperado:** <1 ms promedio, pero reduce variabilidad.
-
-### Métricas objetivo Fase 1
-
-Latencia round-trip total (target):
-
-| Métrica | Antes (base) | Después Fase 1 |
-|---|---|---|
-| Promedio | ~80-120 ms | <30 ms |
-| p95 | ~150 ms | <50 ms |
-| p99 | ~200 ms | <80 ms |
-| Jitter | alto | bajo |
-
-Si Fase 1 no llega a <30 ms promedio, pasamos a Fase 1.5 (WebRTC data channels).
+Si Fase 1 en Windows resulta insuficiente, ver Fase 1.5 (WebRTC data channels).
 
 ---
 
